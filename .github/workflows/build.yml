@@ -39,10 +39,10 @@ jobs:
           HTTP_PID=$!
 
           # 无认证实例（1080）
-          ./target/release/socks5-ipv6 --bind 127.0.0.1:1080 --config /dev/null >/tmp/proxy1.log 2>&1 &
+          ./target/release/sixhop --bind 127.0.0.1:1080 --config /dev/null >/tmp/proxy1.log 2>&1 &
           P1=$!
           # 带认证实例（1081）
-          ./target/release/socks5-ipv6 --bind 127.0.0.1:1081 --username test --password test123 --config /dev/null >/tmp/proxy2.log 2>&1 &
+          ./target/release/sixhop --bind 127.0.0.1:1081 --username test --password test123 --config /dev/null >/tmp/proxy2.log 2>&1 &
           P2=$!
 
           # 等待就绪
@@ -134,14 +134,14 @@ jobs:
           if [ "${{ matrix.target }}" = "x86_64-pc-windows-gnu" ] || [ "${{ matrix.target }}" = "i686-pc-windows-gnu" ]; then
             EXT=".exe"
           fi
-          tar -czf socks5-ipv6-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release socks5-ipv6$EXT
-          sha256sum socks5-ipv6-${{ matrix.target }}.tar.gz
+          tar -czf sixhop-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release sixhop$EXT
+          sha256sum sixhop-${{ matrix.target }}.tar.gz
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: socks5-ipv6-${{ matrix.target }}
-          path: socks5-ipv6-${{ matrix.target }}.tar.gz
+          name: sixhop-${{ matrix.target }}
+          path: sixhop-${{ matrix.target }}.tar.gz
           if-no-files-found: error
 
   # ================= 3) Windows (MSVC) 原生编译 + 本机冒烟 =================
@@ -163,7 +163,7 @@ jobs:
       - name: 冒烟测试（Windows 本机，127.0.0.1:1080）
         shell: pwsh
         run: |
-          $p = Start-Process -FilePath "target\x86_64-pc-windows-msvc\release\socks5-ipv6.exe" `
+          $p = Start-Process -FilePath "target\x86_64-pc-windows-msvc\release\sixhop.exe" `
             -ArgumentList "--bind","127.0.0.1:1080","--config","C:\nonexistent-socks5.toml" `
             -PassThru -WindowStyle Hidden
           try {
@@ -175,13 +175,13 @@ jobs:
           }
 
       - name: 打包
-        run: Compress-Archive -Path "target\x86_64-pc-windows-msvc\release\socks5-ipv6.exe" -DestinationPath "socks5-ipv6-x86_64-pc-windows-msvc.zip" -Force
+        run: Compress-Archive -Path "target\x86_64-pc-windows-msvc\release\sixhop.exe" -DestinationPath "sixhop-x86_64-pc-windows-msvc.zip" -Force
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: socks5-ipv6-x86_64-pc-windows-msvc
-          path: socks5-ipv6-x86_64-pc-windows-msvc.zip
+          name: sixhop-x86_64-pc-windows-msvc
+          path: sixhop-x86_64-pc-windows-msvc.zip
 
   # ================= 4) 在真实 Alpine (x86_64 / arm64) 容器中运行 musl 产物 =================
   test-alpine:
@@ -193,11 +193,11 @@ jobs:
       matrix:
         include:
           - name: alpine-x86_64
-            artifact: socks5-ipv6-x86_64-unknown-linux-musl
+            artifact: sixhop-x86_64-unknown-linux-musl
             image: alpine:3.20
             platform: linux/amd64
           - name: alpine-arm64
-            artifact: socks5-ipv6-aarch64-unknown-linux-musl
+            artifact: sixhop-aarch64-unknown-linux-musl
             image: alpine:3.20
             platform: linux/arm64
     steps:
@@ -216,7 +216,7 @@ jobs:
           tar xzf ${{ matrix.artifact }}.tar.gz
           docker run --rm --platform ${{ matrix.platform }} -v "$PWD:/work" -w /work ${{ matrix.image }} sh -c '
             apk add --no-cache curl >/dev/null
-            ./socks5-ipv6 --bind 127.0.0.1:1080 --config /dev/null >/tmp/p.log 2>&1 &
+            ./sixhop --bind 127.0.0.1:1080 --config /dev/null >/tmp/p.log 2>&1 &
             P=$!
             for i in $(seq 1 30); do
               if curl -fsS --socks5-hostname 127.0.0.1:1080 http://example.com -o /dev/null --max-time 5 2>/dev/null; then
@@ -245,12 +245,12 @@ jobs:
         run: |
           cd artifacts
           sha256sum * > SHA256SUMS.txt
-          tar -czf ../socks5-ipv6-all-targets.tar.gz .
+          tar -czf ../sixhop-all-targets.tar.gz .
 
       - uses: actions/upload-artifact@v4
         with:
-          name: socks5-ipv6-all-targets
-          path: socks5-ipv6-all-targets.tar.gz
+          name: sixhop-all-targets
+          path: sixhop-all-targets.tar.gz
 
   # ================= 6) 打 tag 时自动发布 GitHub Release =================
   release:
@@ -261,9 +261,9 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: socks5-ipv6-all-targets
+          name: sixhop-all-targets
           path: dist
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/socks5-ipv6-all-targets.tar.gz
+          files: dist/sixhop-all-targets.tar.gz
           generate_release_notes: true
