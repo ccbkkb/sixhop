@@ -9,6 +9,14 @@ use std::time::Duration;
 
 // ---------- 工具函数 ----------
 
+/// 把 IpAddr 转成网络序字节（IPv4 -> 4 字节，IPv6 -> 16 字节）
+fn ip_bytes(ip: IpAddr) -> Vec<u8> {
+    match ip {
+        IpAddr::V4(v4) => v4.octets().to_vec(),
+        IpAddr::V6(v6) => v6.octets().to_vec(),
+    }
+}
+
 fn find_free_port() -> u16 {
     TcpListener::bind(("127.0.0.1", 0))
         .unwrap()
@@ -93,7 +101,7 @@ fn socks_connect_no_auth(proxy: SocketAddr, target: SocketAddr, payload: &[u8]) 
     assert_eq!(buf, [5, 0], "应选择无认证方法");
 
     let mut req = vec![5, 1, 0, 1];
-    req.extend_from_slice(&target.ip().octets());
+    req.extend_from_slice(&ip_bytes(target.ip()));
     req.extend_from_slice(&target.port().to_be_bytes());
     s.write_all(&req).unwrap();
 
@@ -139,7 +147,7 @@ fn test_auth_connect_echo() {
 
     // CONNECT 并回显
     let mut req = vec![5, 1, 0, 1];
-    req.extend_from_slice(&echo.ip().octets());
+    req.extend_from_slice(&ip_bytes(echo.ip()));
     req.extend_from_slice(&echo.port().to_be_bytes());
     s.write_all(&req).unwrap();
     let mut rep = [0u8; 10];
@@ -265,7 +273,9 @@ fn test_udp_associate() {
     // SOCKS5 UDP 头：RSV(2)+FRAG(1)+ATYP(1)+目标IP(4)+端口(2)+载荷
     let mut pkt = vec![0u8; 4 + 4 + 2];
     pkt[..4].copy_from_slice(&[0, 0, 0, 1]);
-    pkt[4..8].copy_from_slice(&echo_addr.ip().octets());
+    let echo_bytes = ip_bytes(echo_addr.ip());
+    assert_eq!(echo_bytes.len(), 4, "UDP 测试中 echo 服务器应为 IPv4");
+    pkt[4..8].copy_from_slice(&echo_bytes);
     pkt[8..10].copy_from_slice(&echo_addr.port().to_be_bytes());
     pkt.extend_from_slice(b"udp-ping");
     client_udp.send_to(&pkt, relay_addr).unwrap();
