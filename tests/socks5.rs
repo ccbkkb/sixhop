@@ -46,7 +46,7 @@ impl Drop for ProxyGuard {
 fn spawn_proxy(args: &[&str]) -> ProxyGuard {
     let port = find_free_port();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socks5-ipv6"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sixhop"));
     cmd.arg("--config").arg("__no_such_config__.toml");
     cmd.arg("--bind").arg(format!("127.0.0.1:{port}"));
     for a in args {
@@ -294,7 +294,7 @@ fn test_env_config() {
     // 验证环境变量配置（SOCKS5_BIND + SOCKS5_USERNAME/PASSWORD）
     let port = find_free_port();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_socks5-ipv6"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_sixhop"));
     cmd.arg("--config").arg("__no_such_config__.toml");
     cmd.env("SOCKS5_BIND", addr.to_string());
     cmd.env("SOCKS5_USERNAME", "envuser");
