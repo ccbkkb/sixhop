@@ -1,0 +1,20 @@
+[package]
+name = "sixhop"
+version = "0.1.0"
+edition = "2021"
+description = "单文件高性能 SOCKS5 代理，支持认证与随机出口 IPv6"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
