@@ -1,0 +1,269 @@
+name: Build & Test
+
+on:
+  push:
+    # branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 打 tag 时用于创建 Release
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ================= 1) Linux x86_64：协议级测试 + 冒烟测试 =================
+  test:
+    name: Test (Linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 编译
+        run: cargo build --release
+
+      - name: Rust 集成测试（真实握手/认证/CONNECT/BIND/UDP）
+        run: cargo test --release
+
+      - name: 启动代理冒烟测试（127.0.0.1:1080，不测随机出口 IPv6）
+        run: |
+          set -euxo pipefail
+
+          # 本地 HTTP 服务：测试“代理 CONNECT 到裸 IP”
+          python3 -m http.server 18080 --bind 127.0.0.1 >/dev/null 2>&1 &
+          HTTP_PID=$!
+
+          # 无认证实例（1080）
+          ./target/release/socks5-ipv6 --bind 127.0.0.1:1080 --config /dev/null >/tmp/proxy1.log 2>&1 &
+          P1=$!
+          # 带认证实例（1081）
+          ./target/release/socks5-ipv6 --bind 127.0.0.1:1081 --username test --password test123 --config /dev/null >/tmp/proxy2.log 2>&1 &
+          P2=$!
+
+          # 等待就绪
+          READY=""
+          for i in $(seq 1 30); do
+            if curl -fsS --socks5-hostname 127.0.0.1:1080 http://127.0.0.1:18080/ -o /dev/null --max-time 5 2>/dev/null; then
+              READY=1; break
+            fi
+            sleep 1
+          done
+          if [ -z "$READY" ]; then
+            echo "代理未就绪，日志如下："; cat /tmp/proxy1.log /tmp/proxy2.log; exit 1
+          fi
+
+          echo "== 1. 无认证 + CONNECT 到裸 IP =="
+          curl -fsS --socks5-hostname 127.0.0.1:1080 http://127.0.0.1:18080/ -o /dev/null --max-time 30
+
+          echo "== 2. 无认证 + 域名（代理侧 DNS 解析）=="
+          curl -fsS --socks5-hostname 127.0.0.1:1080 http://example.com -o /dev/null --max-time 30
+
+          echo "== 3. 真实公网出口（代理出去的源 IP）=="
+          curl -fsS --socks5-hostname 127.0.0.1:1080 https://api.ipify.org --max-time 30; echo
+
+          echo "== 4. 带用户名/密码认证 =="
+          curl -fsS --socks5-hostname test:test123@127.0.0.1:1081 http://example.com -o /dev/null --max-time 30
+
+          echo "== 5. 错误密码应被拒绝 =="
+          if curl -fsS --socks5-hostname test:wrong@127.0.0.1:1081 http://example.com -o /dev/null --max-time 10 2>/dev/null; then
+            echo "错误密码竟然成功了，测试失败"; exit 1
+          fi
+
+          echo "== 全部冒烟测试通过 =="
+          kill $P1 $P2 $HTTP_PID 2>/dev/null || true
+
+  # ================= 2) 交叉编译矩阵（Linux glibc/musl + Windows gnu） =================
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 主流 Linux（glibc）
+          - target: x86_64-unknown-linux-gnu
+            use_cross: "false"
+          - target: aarch64-unknown-linux-gnu
+            use_cross: "true"
+          - target: armv7-unknown-linux-gnueabihf
+            use_cross: "true"
+          # Alpine（musl，静态链接）
+          - target: x86_64-unknown-linux-musl
+            use_cross: "true"
+          - target: aarch64-unknown-linux-musl
+            use_cross: "true"
+          - target: armv7-unknown-linux-musleabihf
+            use_cross: "true"
+          # Windows（x64 / x86）
+          - target: x86_64-pc-windows-gnu
+            use_cross: "true"
+          - target: i686-pc-windows-gnu
+            use_cross: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链与目标
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 安装 cross（用于交叉编译）
+        uses: cross-rs/cross@v0.2.5
+        if: matrix.use_cross == 'true'
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: 编译
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      - name: 打包
+        run: |
+          EXT=""
+          if [ "${{ matrix.target }}" = "x86_64-pc-windows-gnu" ] || [ "${{ matrix.target }}" = "i686-pc-windows-gnu" ]; then
+            EXT=".exe"
+          fi
+          tar -czf socks5-ipv6-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release socks5-ipv6$EXT
+          sha256sum socks5-ipv6-${{ matrix.target }}.tar.gz
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: socks5-ipv6-${{ matrix.target }}
+          path: socks5-ipv6-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  # ================= 3) Windows (MSVC) 原生编译 + 本机冒烟 =================
+  build-windows-msvc:
+    name: Build & Test (Windows x86_64 MSVC)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-pc-windows-msvc
+
+      - name: 编译
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: 冒烟测试（Windows 本机，127.0.0.1:1080）
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "target\x86_64-pc-windows-msvc\release\socks5-ipv6.exe" `
+            -ArgumentList "--bind","127.0.0.1:1080","--config","C:\nonexistent-socks5.toml" `
+            -PassThru -WindowStyle Hidden
+          try {
+            Start-Sleep -Seconds 3
+            curl.exe -fsS --socks5-hostname 127.0.0.1:1080 http://example.com -o NUL --max-time 30
+            Write-Host "Windows 冒烟测试通过"
+          } finally {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: 打包
+        run: Compress-Archive -Path "target\x86_64-pc-windows-msvc\release\socks5-ipv6.exe" -DestinationPath "socks5-ipv6-x86_64-pc-windows-msvc.zip" -Force
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: socks5-ipv6-x86_64-pc-windows-msvc
+          path: socks5-ipv6-x86_64-pc-windows-msvc.zip
+
+  # ================= 4) 在真实 Alpine (x86_64 / arm64) 容器中运行 musl 产物 =================
+  test-alpine:
+    name: Test (${{ matrix.name }})
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: alpine-x86_64
+            artifact: socks5-ipv6-x86_64-unknown-linux-musl
+            image: alpine:3.20
+            platform: linux/amd64
+          - name: alpine-arm64
+            artifact: socks5-ipv6-aarch64-unknown-linux-musl
+            image: alpine:3.20
+            platform: linux/arm64
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist
+
+      - name: 注册 QEMU（arm64 模拟需要）
+        if: matrix.platform == 'linux/arm64'
+        run: docker run --rm --privileged tonistiigi/binfmt --install arm64
+
+      - name: 在容器中启动代理并测试（127.0.0.1:1080）
+        run: |
+          cd dist
+          tar xzf ${{ matrix.artifact }}.tar.gz
+          docker run --rm --platform ${{ matrix.platform }} -v "$PWD:/work" -w /work ${{ matrix.image }} sh -c '
+            apk add --no-cache curl >/dev/null
+            ./socks5-ipv6 --bind 127.0.0.1:1080 --config /dev/null >/tmp/p.log 2>&1 &
+            P=$!
+            for i in $(seq 1 30); do
+              if curl -fsS --socks5-hostname 127.0.0.1:1080 http://example.com -o /dev/null --max-time 5 2>/dev/null; then
+                echo "测试通过"
+                kill $P 2>/dev/null
+                exit 0
+              fi
+              sleep 1
+            done
+            cat /tmp/p.log
+            exit 1
+          '
+
+  # ================= 5) 汇总所有产物（含校验和） =================
+  package:
+    name: 汇总产物
+    needs: [ build, build-windows-msvc ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: 生成校验和并打包
+        run: |
+          cd artifacts
+          sha256sum * > SHA256SUMS.txt
+          tar -czf ../socks5-ipv6-all-targets.tar.gz .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: socks5-ipv6-all-targets
+          path: socks5-ipv6-all-targets.tar.gz
+
+  # ================= 6) 打 tag 时自动发布 GitHub Release =================
+  release:
+    name: GitHub Release
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: socks5-ipv6-all-targets
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/socks5-ipv6-all-targets.tar.gz
+          generate_release_notes: true
