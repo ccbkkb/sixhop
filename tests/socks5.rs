@@ -234,7 +234,8 @@ fn test_udp_associate() {
     // UDP 回显服务绑定在 127.0.0.2（与客户端 127.0.0.1 区分，便于中继区分方向）
     let echo = UdpSocket::bind("127.0.0.2:0").unwrap();
     let echo_addr = echo.local_addr().unwrap();
-    let echo_task = thread::spawn(move || {
+    // 回显线程不 join：socket 已移入线程，测试进程结束自然回收
+    thread::spawn(move || {
         let mut buf = [0u8; 1024];
         loop {
             match echo.recv_from(&mut buf) {
@@ -296,7 +297,6 @@ fn test_udp_associate() {
 
     drop(c);
     drop(client_udp);
-    let _ = echo_task.join();
 }
 
 #[test]
