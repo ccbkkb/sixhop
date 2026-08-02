@@ -15,8 +15,8 @@ use std::io::{self, Error, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use rand::Rng;
@@ -71,7 +71,7 @@ struct Args {
     #[arg(long)]
     handshake_timeout: Option<u64>,
 
-    /// 连接空闲超时（秒，0 = 禁用）
+    /// 连接空闲超时（秒，0 = 禁用；双向共享）
     #[arg(long)]
     idle_timeout: Option<u64>,
 
@@ -329,6 +329,15 @@ struct Ctx {
     active: AtomicUsize,
 }
 
+/// 活跃连接守卫：无论任务是否 panic，都会正确递减连接计数
+struct ActiveGuard(Arc<Ctx>);
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 // ============================ SOCKS5 协议 ============================
 
 enum TargetAddr {
@@ -433,6 +442,21 @@ async fn read_target_addr<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<(Target
     Ok((addr, port))
 }
 
+/// 读取 SOCKS5 请求（VER/CMD/RSV/ATYP/ADDR/PORT）
+async fn read_request(stream: &mut TcpStream) -> io::Result<(u8, TargetAddr, u16)> {
+    let ver = stream.read_u8().await?;
+    if ver != 0x05 {
+        return Err(Error::new(ErrorKind::InvalidData, "非 SOCKS5 请求"));
+    }
+    let cmd = stream.read_u8().await?;
+    let rsv = stream.read_u8().await?;
+    if rsv != 0x00 {
+        return Err(Error::new(ErrorKind::InvalidData, "RSV 字段必须为 0"));
+    }
+    let (target, port) = read_target_addr(stream).await?;
+    Ok((cmd, target, port))
+}
+
 async fn write_reply<W: AsyncWrite + Unpin>(w: &mut W, rep: u8, addr: SocketAddr) -> io::Result<()> {
     let mut buf = Vec::with_capacity(22);
     buf.push(0x05);
@@ -477,7 +501,6 @@ async fn resolve_target(target: &TargetAddr, port: u16, prefer_v6: bool) -> io::
 }
 
 /// 出站连接：可先绑定随机源 IPv6，再 connect
-/// （tokio 的 TcpSocket::new_v6() 内部已自动设置 IPV6_V6ONLY=true）
 async fn connect_to(target: SocketAddr, egress: Option<Ipv6Addr>) -> io::Result<TcpStream> {
     match target {
         SocketAddr::V4(addr) => {
@@ -520,13 +543,23 @@ async fn cmd_connect(client: TcpStream, ctx: Arc<Ctx>, target: TargetAddr, port:
         None
     };
 
-    // let mut server = match connect_to(target_addr, egress).await {
-    let server = match connect_to(target_addr, egress).await {
-        Ok(s) => s,
-        Err(e) => {
+    // 出站连接加 30s 上限，避免连黑洞 IP 时任务长时间挂起
+    let mut server = match tokio::time::timeout(
+        Duration::from_secs(30),
+        connect_to(target_addr, egress),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
             let mut c = client;
             fail_reply(&mut c, 0x05).await?; // 连接被拒
             return Err(e);
+        }
+        Err(_) => {
+            let mut c = client;
+            fail_reply(&mut c, 0x05).await?;
+            return Err(Error::new(ErrorKind::TimedOut, "出站连接超时"));
         }
     };
     let _ = server.set_nodelay(true);
@@ -535,8 +568,8 @@ async fn cmd_connect(client: TcpStream, ctx: Arc<Ctx>, target: TargetAddr, port:
     let mut c = client;
     write_reply(&mut c, 0x00, local).await?;
     debug!("CONNECT {} -> {}（出口 {}）", c.peer_addr()?, target_addr, local);
-    let _ = bidirectional_copy(c, server, ctx.config.buffer_size, ctx.idle_timeout).await;
-    Ok(())
+    // 转发阶段无整体超时，仅受可选的“双向共享空闲超时”约束
+    bidirectional_copy(c, server, ctx.config.buffer_size, ctx.idle_timeout).await
 }
 
 /// BIND 命令（FTP 主动模式等）
@@ -574,8 +607,7 @@ async fn cmd_bind(client: TcpStream, ctx: Arc<Ctx>, _target: TargetAddr, _port: 
     let _ = target.set_nodelay(true);
     write_reply(&mut c, 0x00, taddr).await?;
     debug!("BIND {} -> {}（监听 {}）", c.peer_addr()?, taddr, local);
-    let _ = bidirectional_copy(c, target, ctx.config.buffer_size, ctx.idle_timeout).await;
-    Ok(())
+    bidirectional_copy(c, target, ctx.config.buffer_size, ctx.idle_timeout).await
 }
 
 /// UDP ASSOCIATE：创建 UDP 中继（支持随机出口 IPv6 源地址）
@@ -711,22 +743,20 @@ async fn udp_relay(sock: UdpSocket, control_client: SocketAddr, idle_timeout: Op
     }
 }
 
-/// 读取并分发 SOCKS5 请求
-async fn handle_request(stream: TcpStream, ctx: Arc<Ctx>) -> io::Result<()> {
-    let mut s = stream;
-    let ver = s.read_u8().await?;
-    if ver != 0x05 {
-        return Err(Error::new(ErrorKind::InvalidData, "非 SOCKS5 请求"));
-    }
-    let cmd = s.read_u8().await?;
-    let _rsv = s.read_u8().await?;
-    let (target, port) = read_target_addr(&mut s).await?;
-
+/// 分发命令并执行（数据转发阶段）
+async fn dispatch(
+    stream: TcpStream,
+    ctx: Arc<Ctx>,
+    cmd: u8,
+    target: TargetAddr,
+    port: u16,
+) -> io::Result<()> {
     match cmd {
-        0x01 => cmd_connect(s, ctx, target, port).await,
-        0x02 => cmd_bind(s, ctx, target, port).await,
-        0x03 => cmd_udp_associate(s, ctx).await,
+        0x01 => cmd_connect(stream, ctx, target, port).await,
+        0x02 => cmd_bind(stream, ctx, target, port).await,
+        0x03 => cmd_udp_associate(stream, ctx).await,
         _ => {
+            let mut s = stream;
             fail_reply(&mut s, 0x07).await?; // 命令不支持
             Err(Error::new(ErrorKind::InvalidData, "不支持的命令"))
         }
@@ -739,59 +769,105 @@ async fn handle_connection(stream: TcpStream, ctx: Arc<Ctx>) {
     let mut s = stream;
     let _ = s.set_nodelay(true);
 
-    let result = async move {
-        // 握手 + 请求都受超时保护，防止慢速/恶意客户端占着连接
+    // 只有“握手 + 读取请求”需要超时保护；进入数据转发阶段后不做整体超时，
+    // 避免长连接（下载/SSH/流媒体）被误杀。
+    let req = async {
         tokio::time::timeout(ctx.handshake_timeout, handshake(&mut s, &ctx))
             .await
             .map_err(|_| Error::new(ErrorKind::TimedOut, "握手超时"))??;
-        tokio::time::timeout(ctx.handshake_timeout, handle_request(s, ctx))
+        tokio::time::timeout(ctx.handshake_timeout, read_request(&mut s))
             .await
-            .map_err(|_| Error::new(ErrorKind::TimedOut, "请求处理超时"))?
+            .map_err(|_| Error::new(ErrorKind::TimedOut, "请求读取超时"))?
     }
     .await;
 
-    if let Err(e) = result {
-        debug!("连接结束（{e}）: {:?}", peer);
+    match req {
+        Ok((cmd, target, port)) => {
+            let result = dispatch(s, ctx, cmd, target, port).await;
+            if let Err(e) = result {
+                debug!("连接结束（{e}）: {:?}", peer);
+            }
+        }
+        Err(e) => {
+            debug!("握手/请求失败（{e}）: {:?}", peer);
+        }
     }
 }
 
 // ============================ 双向数据搬运 ============================
 
-async fn copy_loop<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
-    r: &mut R,
-    w: &mut W,
-    buf: &mut [u8],
-    idle_timeout: Option<Duration>,
-) -> io::Result<()> {
-    loop {
-        let read = r.read(buf);
-        let n = match idle_timeout {
-            Some(t) => match tokio::time::timeout(t, read).await {
-                Err(_) => return Err(Error::new(ErrorKind::TimedOut, "连接空闲超时")),
-                Ok(res) => res?,
-            },
-            None => read.await?,
-        };
-        if n == 0 {
-            return Ok(());
+/// 连接级空闲计时器：两个方向共享，任一方向有数据即刷新，
+/// 避免“单向长传（如下载大文件）”被误判为空闲。
+struct IdleTimer {
+    last: Mutex<Instant>,
+    timeout: Duration,
+}
+
+impl IdleTimer {
+    fn new(timeout: Duration) -> Self {
+        IdleTimer { last: Mutex::new(Instant::now()), timeout }
+    }
+
+    fn touch(&self) {
+        if let Ok(mut g) = self.last.lock() {
+            *g = Instant::now();
         }
-        w.write_all(&buf[..n]).await?;
+    }
+
+    fn deadline(&self) -> Instant {
+        let last = self.last.lock().map(|g| *g).unwrap_or_else(|_| Instant::now());
+        last + self.timeout
     }
 }
 
+/// 单向拷贝：读 r、写 w；可选共享空闲计时器
 async fn pump<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     r: &mut R,
     w: &mut W,
     buf: &mut [u8],
-    idle_timeout: Option<Duration>,
+    timer: Option<&IdleTimer>,
 ) -> io::Result<()> {
-    let res = copy_loop(r, w, buf, idle_timeout).await;
-    // 一方 EOF 后，shutdown 另一侧写端，让对端也感知到关闭
-    let _ = w.shutdown().await;
-    res
+    loop {
+        match timer {
+            None => {
+                let n = match r.read(buf).await {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                };
+                w.write_all(&buf[..n]).await?;
+            }
+            Some(t) => {
+                let sleep = tokio::time::sleep_until(t.deadline());
+                tokio::pin!(sleep);
+                tokio::select! {
+                    res = r.read(buf) => {
+                        match res {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                t.touch(); // 收到数据即视为连接活跃
+                                w.write_all(&buf[..n]).await?;
+                            }
+                            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    _ = &mut sleep => {
+                        // 到期后复查：另一方向可能刚刷新过计时器
+                        if Instant::now() >= t.deadline() {
+                            return Err(Error::new(ErrorKind::TimedOut, "连接空闲超时"));
+                        }
+                        // 否则继续循环，按新 deadline 重建 sleep
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
-/// 双向并发拷贝，任一方关闭/出错都能及时解除阻塞
+/// 双向并发拷贝：任一方结束/出错立即返回，避免另一方向长时间挂起
 async fn bidirectional_copy(
     a: TcpStream,
     b: TcpStream,
@@ -803,19 +879,23 @@ async fn bidirectional_copy(
     let mut buf_a = vec![0u8; buf_size];
     let mut buf_b = vec![0u8; buf_size];
 
-    let a_to_b = pump(&mut br, &mut aw, &mut buf_a, idle_timeout);
-    let b_to_a = pump(&mut ar, &mut bw, &mut buf_b, idle_timeout);
+    let timer = idle_timeout.map(IdleTimer::new);
 
-    let (r1, r2) = tokio::join!(a_to_b, b_to_a);
-    match (r1, r2) {
-        (Err(e), _) | (_, Err(e)) => Err(e),
-        _ => Ok(()),
+    let a_to_b = pump(&mut br, &mut aw, &mut buf_a, timer.as_ref());
+    let b_to_a = pump(&mut ar, &mut bw, &mut buf_b, timer.as_ref());
+
+    tokio::pin!(a_to_b);
+    tokio::pin!(b_to_a);
+
+    tokio::select! {
+        r = &mut a_to_b => r,
+        r = &mut b_to_a => r,
     }
 }
 
 // ============================ 监听器 / 信号 / 统计 ============================
 
-async fn create_listener(bind: SocketAddr) -> io::Result<TcpListener> {
+fn create_listener(bind: SocketAddr) -> io::Result<TcpListener> {
     let sock = match bind {
         SocketAddr::V4(_) => TcpSocket::new_v4()?,
         SocketAddr::V6(_) => TcpSocket::new_v6()?,
@@ -867,7 +947,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse()
         .map_err(|_| Error::new(ErrorKind::InvalidInput, format!("无效的监听地址: {}", cfg.bind_addr)))?;
 
-    let listener = create_listener(bind).await?;
+    let listener = create_listener(bind)?;
     let local = listener.local_addr()?;
 
     let blocks = parse_ipv6_blocks(&cfg.ipv6_blocks)?;
@@ -897,7 +977,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let stats_handle = tokio::spawn(stats_loop(ctx.clone()));
-    let mut tasks = tokio::task::JoinSet::new();
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
@@ -911,43 +990,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match res {
                     Ok((stream, addr)) => {
                         let ctx_for_task = ctx.clone();
-                        let permit = match &ctx_for_task.semaphore {
-                            Some(sem) => match sem.clone().try_acquire_owned() {
-                                Ok(p) => Some(p),
-                                Err(_) => None,
-                            },
-                            None => None,
-                        };
-                        if let Some(p) = permit {
+
+                        // 有最大连接数限制时获取信号量；无限制时始终放行
+                        let mut permit: Option<tokio::sync::OwnedSemaphorePermit> = None;
+                        let mut accepted = true;
+                        if let Some(sem) = &ctx_for_task.semaphore {
+                            match sem.clone().try_acquire_owned() {
+                                Ok(p) => permit = Some(p),
+                                Err(_) => accepted = false,
+                            }
+                        }
+
+                        if accepted {
                             ctx_for_task.active.fetch_add(1, Ordering::Relaxed);
-                            tasks.spawn(async move {
-                                let _permit = p;
-                                handle_connection(stream, ctx_for_task.clone()).await;
-                                ctx_for_task.active.fetch_sub(1, Ordering::Relaxed);
+                            tokio::spawn(async move {
+                                let _guard = ActiveGuard(ctx_for_task.clone()); // 保证计数递减
+                                let _permit = permit;                          // 连接结束才释放信号量
+                                handle_connection(stream, ctx_for_task).await;
                             });
                         } else {
                             warn!("达到最大连接数上限，拒绝 {addr}");
                             drop(stream);
                         }
                     }
-                    Err(e) => error!("accept 错误: {e}"),
+                    Err(e) => {
+                        error!("accept 错误: {e}");
+                        // 防止 accept 持续报错（如 EMFILE）时 CPU 空转
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
                 }
             }
         }
     }
 
-    // 优雅退出
+    // 优雅退出：停止接受新连接，等待在途连接结束（最多 10 秒）
     drop(listener);
-    info!("等待 {} 个连接任务结束...", tasks.len());
-    loop {
-        match tokio::time::timeout(Duration::from_secs(10), tasks.join_next()).await {
-            Ok(Some(_)) => continue,
-            Ok(None) => break,
-            Err(_) => {
-                warn!("连接任务未能及时结束，强制退出");
-                break;
-            }
+    info!("等待在途连接结束（最多 10 秒）...");
+    let mut waited = 0u32;
+    while ctx.active.load(Ordering::Relaxed) > 0 {
+        if waited >= 100 {
+            warn!(
+                "等待超时，强制退出（仍有 {} 个连接）",
+                ctx.active.load(Ordering::Relaxed)
+            );
+            break;
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        waited += 1;
     }
     stats_handle.abort();
     info!("代理已退出");
