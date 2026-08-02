@@ -520,7 +520,8 @@ async fn cmd_connect(client: TcpStream, ctx: Arc<Ctx>, target: TargetAddr, port:
         None
     };
 
-    let mut server = match connect_to(target_addr, egress).await {
+    // let mut server = match connect_to(target_addr, egress).await {
+    let server = match connect_to(target_addr, egress).await {
         Ok(s) => s,
         Err(e) => {
             let mut c = client;
