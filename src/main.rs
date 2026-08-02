@@ -16,7 +16,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use clap::Parser;
 use rand::Rng;
@@ -544,7 +544,7 @@ async fn cmd_connect(client: TcpStream, ctx: Arc<Ctx>, target: TargetAddr, port:
     };
 
     // 出站连接加 30s 上限，避免连黑洞 IP 时任务长时间挂起
-    let mut server = match tokio::time::timeout(
+    let server = match tokio::time::timeout(
         Duration::from_secs(30),
         connect_to(target_addr, egress),
     )
@@ -567,7 +567,8 @@ async fn cmd_connect(client: TcpStream, ctx: Arc<Ctx>, target: TargetAddr, port:
 
     let mut c = client;
     write_reply(&mut c, 0x00, local).await?;
-    debug!("CONNECT {} -> {}（出口 {}）", c.peer_addr()?, target_addr, local);
+    let peer = c.peer_addr().ok();
+    debug!("CONNECT {:?} -> {}（出口 {}）", peer, target_addr, local);
     // 转发阶段无整体超时，仅受可选的“双向共享空闲超时”约束
     bidirectional_copy(c, server, ctx.config.buffer_size, ctx.idle_timeout).await
 }
@@ -606,7 +607,8 @@ async fn cmd_bind(client: TcpStream, ctx: Arc<Ctx>, _target: TargetAddr, _port: 
         };
     let _ = target.set_nodelay(true);
     write_reply(&mut c, 0x00, taddr).await?;
-    debug!("BIND {} -> {}（监听 {}）", c.peer_addr()?, taddr, local);
+    let peer = c.peer_addr().ok();
+    debug!("BIND {:?} -> {}（监听 {}）", peer, taddr, local);
     bidirectional_copy(c, target, ctx.config.buffer_size, ctx.idle_timeout).await
 }
 
@@ -647,10 +649,12 @@ async fn cmd_udp_associate(client: TcpStream, ctx: Arc<Ctx>) -> io::Result<()> {
     Ok(())
 }
 
-/// UDP 中继循环：解析 SOCKS5 UDP 头并双向转发
+/// UDP 中继循环：解析 SOCKS5 UDP 头并双向转发。
+///
+/// 方向判定：来源 IP == 客户端 IP 视为客户端数据报（同时更新客户端实际 UDP 来源）；
+/// 其余来源一律视为目标回包转发给客户端（宽松策略，兼容回包源端口与请求端口不一致的场景）。
 async fn udp_relay(sock: UdpSocket, control_client: SocketAddr, idle_timeout: Option<Duration>) {
     let mut buf = vec![0u8; 65536];
-    // 初始用 TCP 控制连接地址；收到客户端数据报后更新为其真实 UDP 来源地址
     let mut client = control_client;
     loop {
         let recv = sock.recv_from(&mut buf);
@@ -670,7 +674,7 @@ async fn udp_relay(sock: UdpSocket, control_client: SocketAddr, idle_timeout: Op
             client = src;
             if n < 4 { continue; }
             if buf[0] != 0 || buf[1] != 0 { continue; } // RSV 必须为 0
-            if buf[2] != 0 { continue; }                // 暂不支持分片
+            if buf[2] != 0 { continue; }                // 暂不支持分片（FRAG）
             let atyp = buf[3];
             let mut off = 4usize;
 
@@ -799,23 +803,27 @@ async fn handle_connection(stream: TcpStream, ctx: Arc<Ctx>) {
 /// 连接级空闲计时器：两个方向共享，任一方向有数据即刷新，
 /// 避免“单向长传（如下载大文件）”被误判为空闲。
 struct IdleTimer {
-    last: Mutex<Instant>,
+    last: Mutex<tokio::time::Instant>,
     timeout: Duration,
 }
 
 impl IdleTimer {
     fn new(timeout: Duration) -> Self {
-        IdleTimer { last: Mutex::new(Instant::now()), timeout }
+        IdleTimer { last: Mutex::new(tokio::time::Instant::now()), timeout }
     }
 
     fn touch(&self) {
         if let Ok(mut g) = self.last.lock() {
-            *g = Instant::now();
+            *g = tokio::time::Instant::now();
         }
     }
 
-    fn deadline(&self) -> Instant {
-        let last = self.last.lock().map(|g| *g).unwrap_or_else(|_| Instant::now());
+    fn deadline(&self) -> tokio::time::Instant {
+        let last = self
+            .last
+            .lock()
+            .map(|g| *g)
+            .unwrap_or_else(|_| tokio::time::Instant::now());
         last + self.timeout
     }
 }
@@ -855,7 +863,7 @@ async fn pump<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     }
                     _ = &mut sleep => {
                         // 到期后复查：另一方向可能刚刷新过计时器
-                        if Instant::now() >= t.deadline() {
+                        if tokio::time::Instant::now() >= t.deadline() {
                             return Err(Error::new(ErrorKind::TimedOut, "连接空闲超时"));
                         }
                         // 否则继续循环，按新 deadline 重建 sleep
@@ -925,6 +933,7 @@ async fn shutdown_signal() {
 
 async fn stats_loop(ctx: Arc<Ctx>) {
     let mut interval = tokio::time::interval(Duration::from_secs(60));
+    interval.tick().await; // 跳过首次立即触发的 tick
     loop {
         interval.tick().await;
         info!("当前活跃连接数: {}", ctx.active.load(Ordering::Relaxed));
