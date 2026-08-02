@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! # socks5-ipv6 — 单文件高性能 SOCKS5 代理
+//! # sixhop — 单文件高性能 SOCKS5 代理
 //!
 //! 特性：
 //! - SOCKS5 完整握手 + 用户名/密码认证（RFC 1929）
@@ -29,7 +29,7 @@ use tracing::{debug, error, info, warn};
 // ============================ 命令行参数 ============================
 
 #[derive(Parser, Debug)]
-#[command(name = "socks5-ipv6", version, about = "单文件高性能 SOCKS5 代理，支持认证与随机出口 IPv6")]
+#[command(name = "sixhop", version, about = "单文件高性能 SOCKS5 代理，支持认证与随机出口 IPv6")]
 struct Args {
     /// 配置文件路径（TOML）
     #[arg(short = 'c', long, default_value = "socks5.toml")]
@@ -477,6 +477,7 @@ async fn resolve_target(target: &TargetAddr, port: u16, prefer_v6: bool) -> io::
 }
 
 /// 出站连接：可先绑定随机源 IPv6，再 connect
+/// （tokio 的 TcpSocket::new_v6() 内部已自动设置 IPV6_V6ONLY=true）
 async fn connect_to(target: SocketAddr, egress: Option<Ipv6Addr>) -> io::Result<TcpStream> {
     match target {
         SocketAddr::V4(addr) => {
@@ -485,7 +486,6 @@ async fn connect_to(target: SocketAddr, egress: Option<Ipv6Addr>) -> io::Result<
         }
         SocketAddr::V6(addr) => {
             let sock = TcpSocket::new_v6()?;
-            sock.set_only_v6(true)?;
             if let Some(src) = egress {
                 sock.bind(SocketAddr::new(IpAddr::V6(src), 0))?;
             }
@@ -529,7 +529,6 @@ async fn cmd_connect(client: TcpStream, ctx: Arc<Ctx>, target: TargetAddr, port:
         }
     };
     let _ = server.set_nodelay(true);
-    let _ = server.set_keepalive(Some(Duration::from_secs(60)));
     let local = server.local_addr()?;
 
     let mut c = client;
@@ -552,7 +551,6 @@ async fn cmd_bind(client: TcpStream, ctx: Arc<Ctx>, _target: TargetAddr, _port: 
         };
         let ip = egress.unwrap_or(Ipv6Addr::UNSPECIFIED);
         let sock = TcpSocket::new_v6()?;
-        sock.set_only_v6(true)?;
         sock.bind(SocketAddr::new(IpAddr::V6(ip), 0))?;
         sock.listen(1024)?
     } else {
@@ -599,7 +597,7 @@ async fn cmd_udp_associate(client: TcpStream, ctx: Arc<Ctx>) -> io::Result<()> {
     let relay_addr = relay.local_addr()?;
     write_reply(&mut c, 0x00, relay_addr).await?;
 
-    let task = tokio::spawn(udp_relay(relay, client_addr, ctx.idle_timeout));
+    let mut task = tokio::spawn(udp_relay(relay, client_addr, ctx.idle_timeout));
     let mut buf = [0u8; 1024];
     loop {
         tokio::select! {
@@ -660,12 +658,15 @@ async fn udp_relay(sock: UdpSocket, control_client: SocketAddr, idle_timeout: Op
                         Err(_) => continue,
                     };
                     off += len;
-                    match tokio::net::lookup_host((domain.as_str(), 0)).await {
-                        Ok(mut addrs) => match addrs.next() {
-                            Some(a) => a.ip(),
-                            None => continue,
-                        },
-                        Err(_) => continue,
+                    // 先取出 owned 的解析结果，避免 domain 的借用跨块存活
+                    let resolved: Option<IpAddr> =
+                        match tokio::net::lookup_host((domain.as_str(), 0)).await {
+                            Ok(mut addrs) => addrs.next().map(|a| a.ip()),
+                            Err(_) => None,
+                        };
+                    match resolved {
+                        Some(ip) => ip,
+                        None => continue,
                     }
                 }
                 0x04 => {
@@ -736,7 +737,6 @@ async fn handle_connection(stream: TcpStream, ctx: Arc<Ctx>) {
     let peer = stream.peer_addr().ok();
     let mut s = stream;
     let _ = s.set_nodelay(true);
-    let _ = s.set_keepalive(Some(Duration::from_secs(60)));
 
     let result = async move {
         // 握手 + 请求都受超时保护，防止慢速/恶意客户端占着连接
@@ -761,8 +761,7 @@ async fn copy_loop<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     w: &mut W,
     buf: &mut [u8],
     idle_timeout: Option<Duration>,
-) -> io::Result<u64> {
-    let mut total: u64 = 0;
+) -> io::Result<()> {
     loop {
         let read = r.read(buf);
         let n = match idle_timeout {
@@ -773,10 +772,9 @@ async fn copy_loop<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             None => read.await?,
         };
         if n == 0 {
-            return Ok(total);
+            return Ok(());
         }
         w.write_all(&buf[..n]).await?;
-        total += n as u64;
     }
 }
 
@@ -799,8 +797,8 @@ async fn bidirectional_copy(
     buf_size: usize,
     idle_timeout: Option<Duration>,
 ) -> io::Result<()> {
-    let (ar, aw) = a.into_split();
-    let (br, bw) = b.into_split();
+    let (mut ar, mut aw) = a.into_split();
+    let (mut br, mut bw) = b.into_split();
     let mut buf_a = vec![0u8; buf_size];
     let mut buf_b = vec![0u8; buf_size];
 
@@ -821,9 +819,6 @@ async fn create_listener(bind: SocketAddr) -> io::Result<TcpListener> {
         SocketAddr::V4(_) => TcpSocket::new_v4()?,
         SocketAddr::V6(_) => TcpSocket::new_v6()?,
     };
-    if bind.is_ipv6() {
-        sock.set_only_v6(true)?;
-    }
     sock.set_reuseaddr(true)?;
     sock.bind(bind)?;
     sock.listen(16384)
