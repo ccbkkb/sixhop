@@ -112,8 +112,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: 安装 cross（用于交叉编译）
-        uses: cross-rs/cross@v0.2.5
+      - name: 安装 cross（预编译二进制）
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
         if: matrix.use_cross == 'true'
 
       - uses: Swatinem/rust-cache@v2
